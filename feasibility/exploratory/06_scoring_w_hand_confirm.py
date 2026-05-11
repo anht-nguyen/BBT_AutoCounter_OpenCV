@@ -18,10 +18,11 @@ from feasibility.src.motion_mask_cleaning import clean_motion_mask
 from feasibility.src.motion_mask_cleaning import draw_contour_debug
 from feasibility.src.motion_mask_cleaning import filter_contours_by_area
 from feasibility.src.motion_mask_cleaning import resize_frame
+from feasibility.src.object_transfer_confirmation import ObjectTransferConfirmator
 
 
 VIDEO_PATH = FEASIBILITY_ROOT / "data" / "videos" / "raw" / "BBT-ground_truth.mp4"
-OUTPUT_VIDEO = FEASIBILITY_ROOT / "data" / "videos" / "annotated" / "BBT-ground_truth_scoring_with_hand_confirmation.mp4"
+OUTPUT_DIR = FEASIBILITY_ROOT / "data" / "videos" / "annotated"
 WINDOW_NAME = "BBT Scoring With Hand Confirmation"
 DISPLAY_SCALE = 0.60
 RESIZE_WIDTH = 1280
@@ -38,15 +39,19 @@ LEADING_EDGE_MARGIN = 10
 TARGET_CONFIRMATION_WINDOW_FRAMES = 10
 TARGET_MOTION_AREA_THRESHOLD = 300
 
-FINGERTIP_MARGIN = 10
+FINGERTIP_MARGIN = 5
 HAND_MASK_PADDING = 20
 HAND_MASK_DILATION = 15
 TARGET_NON_HAND_MOTION_THRESHOLD = 300
+PERSISTENCE_MOTION_THRESHOLD = 120
+PERSISTENCE_FRAMES_REQUIRED = 2
+ABSENCE_RESET_FRAMES = 4
 SELECTED_FINGERTIPS = ("thumb", "index", "middle")
 MODEL_ASSET_PATH = None
 
 # A short memory helps align fingertip crossing with the motion-based event.
-FINGERTIP_CONFIRM_WINDOW_FRAMES = 5
+FINGERTIP_CONFIRM_WINDOW_FRAMES = 10
+OBJECT_CONFIRM_WINDOW_FRAMES = 5
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--save-output",
         type=Path,
-        default=OUTPUT_VIDEO,
-        help="Path for the saved annotated comparison video.",
+        default=None,
+        help="Optional path for the saved annotated comparison video.",
     )
     return parser.parse_args()
 
@@ -125,9 +130,16 @@ def open_writer(output_path: Path, frame_size: tuple[int, int], fps: float) -> c
     return writer
 
 
+def resolve_output_path(video_path: Path, save_output: Path | None) -> Path:
+    if save_output is not None:
+        return save_output.expanduser().resolve()
+    return (OUTPUT_DIR / f"{video_path.stem}_scoring_with_hand_confirmation.mp4").resolve()
+
+
 def main() -> int:
     args = parse_args()
     video_path = args.video.expanduser().resolve()
+    output_path = resolve_output_path(video_path, args.save_output)
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -164,6 +176,15 @@ def main() -> int:
             "2. or place the model at feasibility/models/hand_landmarker.task"
         ) from exc
 
+    object_confirmator = ObjectTransferConfirmator(
+        partition_x=PARTITION_X,
+        direction=DIRECTION,
+        target_motion_threshold=TARGET_NON_HAND_MOTION_THRESHOLD,
+        persistence_motion_threshold=PERSISTENCE_MOTION_THRESHOLD,
+        persistence_frames_required=PERSISTENCE_FRAMES_REQUIRED,
+        absence_reset_frames=ABSENCE_RESET_FRAMES,
+    )
+
     background_subtractor = cv2.createBackgroundSubtractorMOG2(
         history=500,
         varThreshold=50,
@@ -177,9 +198,11 @@ def main() -> int:
     frame_index = 0
     combined_count = 0
     last_fingertip_cross_frame = None
+    last_object_confirm_frame = None
     total_motion_events = 0
     total_hand_confirmed_events = 0
     rejected_motion_events_without_hand = 0
+    rejected_motion_events_without_object = 0
 
     try:
         while True:
@@ -200,13 +223,20 @@ def main() -> int:
 
             motion_result = counter.update(cleaned_mask, frame_idx=frame_index)
             hand_result = confirmator.analyze_frame(resized_frame, cleaned_mask)
+            object_result = object_confirmator.analyze_frame(hand_result["non_hand_motion_mask"])
 
             if hand_result["fingertip_crossed"]:
                 last_fingertip_cross_frame = frame_index
+            if object_result.object_confirmed:
+                last_object_confirm_frame = frame_index
 
             fingertip_recent = (
                 last_fingertip_cross_frame is not None
                 and (frame_index - last_fingertip_cross_frame) <= FINGERTIP_CONFIRM_WINDOW_FRAMES
+            )
+            object_recent = (
+                last_object_confirm_frame is not None
+                and (frame_index - last_object_confirm_frame) <= OBJECT_CONFIRM_WINDOW_FRAMES
             )
             possible_block_without_fingertip = confirmator.detect_block_without_fingertip_crossing(
                 hand_result,
@@ -214,20 +244,24 @@ def main() -> int:
             )
 
             motion_event_detected = bool(motion_result["event_detected"])
-            hand_confirmed_score = motion_event_detected and fingertip_recent
+            hand_confirmed_score = motion_event_detected and fingertip_recent and object_recent
             if motion_event_detected:
                 total_motion_events += 1
                 if hand_confirmed_score:
                     combined_count += 1
                     total_hand_confirmed_events += 1
                 else:
-                    rejected_motion_events_without_hand += 1
+                    if not fingertip_recent:
+                        rejected_motion_events_without_hand += 1
+                    if not object_recent:
+                        rejected_motion_events_without_object += 1
 
             scoring_frame = confirmator.draw_debug_overlay(
                 resized_frame,
                 hand_result,
                 target_non_hand_motion_threshold=TARGET_NON_HAND_MOTION_THRESHOLD,
             )
+            scoring_frame = object_confirmator.draw_debug_overlay(scoring_frame, object_result)
             scoring_frame = counter.draw_debug_overlay(scoring_frame, motion_result)
 
             score_label = f"Scored: {'YES' if hand_confirmed_score else 'NO'}"
@@ -238,6 +272,10 @@ def main() -> int:
                 f"Fingertip crossed: {'YES' if hand_result['fingertip_crossed'] else 'NO'} | "
                 f"Recent: {'YES' if fingertip_recent else 'NO'}"
             )
+            object_label = (
+                f"Object confirmed: {'YES' if object_result.object_confirmed else 'NO'} | "
+                f"Recent: {'YES' if object_recent else 'NO'}"
+            )
             invalid_label = (
                 f"Possible block without fingertip: {'YES' if possible_block_without_fingertip else 'NO'} | "
                 f"Target non-hand area: {hand_result['target_non_hand_motion_area']}"
@@ -247,11 +285,15 @@ def main() -> int:
                 f"Hand-confirmed events: {total_hand_confirmed_events} | "
                 f"Rejected by hand gate: {rejected_motion_events_without_hand}"
             )
+            object_event_label = (
+                f"Persistence: {'YES' if object_result.persistence_detected else 'NO'} | "
+                f"Object gate rejects: {rejected_motion_events_without_object}"
+            )
 
             cv2.putText(
                 scoring_frame,
                 f"{score_label} | {count_label}",
-                (20, resized_frame.shape[0] - 140),
+                (20, resized_frame.shape[0] - 170),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.82,
                 (255, 255, 255),
@@ -261,7 +303,7 @@ def main() -> int:
             cv2.putText(
                 scoring_frame,
                 f"{status_label} | {mode_label}",
-                (20, resized_frame.shape[0] - 110),
+                (20, resized_frame.shape[0] - 140),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.68,
                 (255, 255, 255),
@@ -271,6 +313,16 @@ def main() -> int:
             cv2.putText(
                 scoring_frame,
                 hand_label,
+                (20, resized_frame.shape[0] - 110),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.68,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                scoring_frame,
+                object_label,
                 (20, resized_frame.shape[0] - 80),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.68,
@@ -291,6 +343,16 @@ def main() -> int:
             cv2.putText(
                 scoring_frame,
                 event_label,
+                (20, resized_frame.shape[0] - 50),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.68,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                scoring_frame,
+                object_event_label,
                 (20, resized_frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.68,
@@ -331,7 +393,7 @@ def main() -> int:
 
             if writer is None:
                 writer = open_writer(
-                    args.save_output.expanduser().resolve(),
+                    output_path,
                     (comparison_view.shape[1], comparison_view.shape[0]),
                     fps,
                 )
@@ -353,11 +415,12 @@ def main() -> int:
 
     print(f"Processed video: {video_path}")
     print(f"Frames processed: {frame_index}")
-    print(f"Saved annotated video: {args.save_output.expanduser().resolve()}")
+    print(f"Saved annotated video: {output_path}")
     print(f"Combined score count: {combined_count}")
     print(f"Total motion events: {total_motion_events}")
     print(f"Hand-confirmed events: {total_hand_confirmed_events}")
     print(f"Rejected motion events without hand confirmation: {rejected_motion_events_without_hand}")
+    print(f"Rejected motion events without object confirmation: {rejected_motion_events_without_object}")
     print(f"Motion detector candidate crossings: {counter.total_candidate_crossings}")
     print(f"Motion detector confirmed crossings: {counter.confirmed_crossings}")
     return 0
