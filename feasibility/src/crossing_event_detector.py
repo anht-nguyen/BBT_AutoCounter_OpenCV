@@ -20,7 +20,7 @@ except ImportError:
             opening_iterations=1,
             closing_iterations=1,
         ):
-            """Simple fallback cleaner used if the shared module is not available."""
+            """Fallback cleaner used only if the shared module is not available."""
             blur_kernel_size = max(int(blur_kernel_size), 1)
             morph_kernel_size = max(int(morph_kernel_size), 1)
             if blur_kernel_size % 2 == 0:
@@ -46,6 +46,12 @@ except ImportError:
             return cleaned_mask
 
 
+WAITING_FOR_START = "WAITING_FOR_START"
+ARMED = "ARMED"
+CANDIDATE_PENDING = "CANDIDATE_PENDING"
+COOLDOWN = "COOLDOWN"
+
+
 class CrossingCounter:
     def __init__(
         self,
@@ -56,7 +62,9 @@ class CrossingCounter:
         min_area: int = 500,
         cooldown_frames: int = 20,
         leading_edge_margin: int = 10,
-        crossing_method: str = "leading_edge",
+        confirmation_mode: str = "hybrid",
+        target_confirmation_window_frames: int = 10,
+        target_motion_area_threshold: int = 300,
     ) -> None:
         self.partition_x = int(partition_x)
         self.direction = str(direction)
@@ -65,7 +73,9 @@ class CrossingCounter:
         self.min_area = max(int(min_area), 1)
         self.cooldown_frames = max(int(cooldown_frames), 0)
         self.leading_edge_margin = max(int(leading_edge_margin), 0)
-        self.crossing_method = str(crossing_method)
+        self.confirmation_mode = str(confirmation_mode)
+        self.target_confirmation_window_frames = max(int(target_confirmation_window_frames), 1)
+        self.target_motion_area_threshold = max(int(target_motion_area_threshold), 0)
         self.reset()
 
     def reset(self) -> None:
@@ -74,12 +84,21 @@ class CrossingCounter:
         self.armed_for_crossing = False
         self.last_count_frame = -self.cooldown_frames
         self.last_event_detected = False
-        self.last_scored_frame = -1
         self.current_side = "none"
         self.current_blob_center = None
         self.current_blob_area = 0.0
         self.current_left_edge = None
         self.current_right_edge = None
+
+        # Hybrid mode keeps explicit state so we can wait for confirmation.
+        self.state = WAITING_FOR_START
+        self.candidate_pending = False
+        self.candidate_frame_idx = None
+
+        # Summary values help compare counting modes on the same pilot videos.
+        self.total_candidate_crossings = 0
+        self.confirmed_crossings = 0
+        self.rejected_candidates = 0
 
     def classify_side(self, center_x):
         if center_x is None:
@@ -96,25 +115,12 @@ class CrossingCounter:
         return "neutral"
 
     def is_valid_transition(self, previous_side, current_side):
-        if previous_side is None:
+        if previous_side is None or previous_side == current_side:
             return False
-        if previous_side == current_side:
-            return False
-
         if self.direction == "left_to_right":
             return previous_side == "left" and current_side == "right"
         if self.direction == "right_to_left":
             return previous_side == "right" and current_side == "left"
-        raise ValueError("direction must be 'left_to_right' or 'right_to_left'")
-
-    def has_leading_edge_crossed(self, blob_info):
-        if blob_info is None:
-            return False
-
-        if self.direction == "left_to_right":
-            return blob_info["right_edge"] > (self.partition_x + self.leading_edge_margin)
-        if self.direction == "right_to_left":
-            return blob_info["left_edge"] < (self.partition_x - self.leading_edge_margin)
         raise ValueError("direction must be 'left_to_right' or 'right_to_left'")
 
     def _get_start_side(self):
@@ -123,6 +129,9 @@ class CrossingCounter:
         if self.direction == "right_to_left":
             return "right"
         raise ValueError("direction must be 'left_to_right' or 'right_to_left'")
+
+    def _get_target_side(self):
+        return "right" if self._get_start_side() == "left" else "left"
 
     def _blob_majority_side(self, blob_info):
         if blob_info is None:
@@ -146,6 +155,38 @@ class CrossingCounter:
 
     def _cooldown_remaining(self, frame_idx):
         return max(0, self.cooldown_frames - (int(frame_idx) - self.last_count_frame))
+
+    def _candidate_age_frames(self, frame_idx):
+        if self.candidate_frame_idx is None:
+            return None
+        return int(frame_idx) - int(self.candidate_frame_idx)
+
+    def has_leading_edge_crossed(self, blob_info):
+        if blob_info is None:
+            return False
+        if self.direction == "left_to_right":
+            return blob_info["right_edge"] > (self.partition_x + self.leading_edge_margin)
+        if self.direction == "right_to_left":
+            return blob_info["left_edge"] < (self.partition_x - self.leading_edge_margin)
+        raise ValueError("direction must be 'left_to_right' or 'right_to_left'")
+
+    def compute_target_side_motion_area(self, cleaned_mask):
+        """Measure how much motion is visible on the target side of the partition."""
+        frame_width = cleaned_mask.shape[1]
+        if self.direction == "left_to_right":
+            target_mask = cleaned_mask[:, min(self.partition_x, frame_width):]
+        elif self.direction == "right_to_left":
+            target_mask = cleaned_mask[:, :max(self.partition_x, 0)]
+        else:
+            raise ValueError("direction must be 'left_to_right' or 'right_to_left'")
+
+        # Counting white pixels is a simple first-pass motion measure.
+        return int(cv2.countNonZero(target_mask))
+
+    def has_target_confirmation(self, cleaned_mask):
+        target_motion_area = self.compute_target_side_motion_area(cleaned_mask)
+        target_confirmed = target_motion_area >= self.target_motion_area_threshold
+        return target_confirmed, target_motion_area
 
     def find_main_blob(self, cleaned_mask):
         _, frame_width = cleaned_mask.shape[:2]
@@ -174,161 +215,211 @@ class CrossingCounter:
             cy = y + (h // 2)
 
         full_frame_x = x + x1
-        full_frame_bbox = (full_frame_x, y, w, h)
-        full_frame_center = (cx + x1, cy)
-        left_edge = full_frame_x
-        right_edge = full_frame_x + w
         return {
             "contour": contour,
             "area": area,
-            "bbox": full_frame_bbox,
-            "center": full_frame_center,
-            "left_edge": left_edge,
-            "right_edge": right_edge,
+            "bbox": (full_frame_x, y, w, h),
+            "center": (cx + x1, cy),
+            "left_edge": full_frame_x,
+            "right_edge": full_frame_x + w,
             "zone_bounds": (x1, x2),
         }
 
-    def update(self, cleaned_mask, frame_idx):
-        blob_info = self.find_main_blob(cleaned_mask)
-        event_detected = False
-        zone_bounds = None
-        bbox = None
-        blob_center = None
-        blob_area = 0.0
-        left_edge = None
-        right_edge = None
-        current_side = "none"
-        cooldown_remaining = self._cooldown_remaining(frame_idx)
-
-        if blob_info is None:
-            self.last_event_detected = False
-            self.current_side = "none"
-            self.current_blob_center = None
-            self.current_blob_area = 0.0
-            self.current_left_edge = None
-            self.current_right_edge = None
-            return {
-                "count": self.count,
-                "event_detected": False,
-                "motion_scored": False,
-                "score_status": "no blob",
-                "crossing_method": self.crossing_method,
-                "leading_edge_margin": self.leading_edge_margin,
-                "current_side": self.current_side,
-                "previous_side": self.previous_side,
-                "armed_for_crossing": self.armed_for_crossing,
-                "blob_center": self.current_blob_center,
-                "blob_area": self.current_blob_area,
-                "left_edge": self.current_left_edge,
-                "right_edge": self.current_right_edge,
-                "bbox": None,
-                "zone_bounds": None,
-                "cooldown_remaining": cooldown_remaining,
-            }
-
-        bbox = blob_info["bbox"]
-        blob_center = blob_info["center"]
-        blob_area = blob_info["area"]
-        left_edge = blob_info["left_edge"]
-        right_edge = blob_info["right_edge"]
-        zone_bounds = blob_info["zone_bounds"]
-        current_side = self.classify_side(blob_center[0])
-        observed_previous_side = self.previous_side
-        is_in_cooldown = cooldown_remaining > 0
-
+    def _arm_if_start_side_seen(self, blob_info, current_side):
         if self._blob_is_on_start_side(blob_info, current_side):
             self.armed_for_crossing = True
+            if self.confirmation_mode == "hybrid" and self.state == WAITING_FOR_START:
+                self.state = ARMED
 
-        if self.crossing_method == "center":
-            if current_side != "neutral" and current_side != "none":
-                if self.is_valid_transition(observed_previous_side, current_side) and not is_in_cooldown:
-                    self.count += 1
-                    event_detected = True
-                    self.last_count_frame = int(frame_idx)
-                    self.last_scored_frame = int(frame_idx)
-                    self.armed_for_crossing = False
-                    cooldown_remaining = self._cooldown_remaining(frame_idx)
-                self.previous_side = current_side
-        elif self.crossing_method == "leading_edge":
-            leading_edge_crossed = self.has_leading_edge_crossed(blob_info)
-            if self.armed_for_crossing and leading_edge_crossed and not is_in_cooldown:
-                self.count += 1
-                event_detected = True
-                self.last_count_frame = int(frame_idx)
-                self.last_scored_frame = int(frame_idx)
-                self.armed_for_crossing = False
-                cooldown_remaining = self._cooldown_remaining(frame_idx)
-            if current_side not in ("none", "neutral"):
-                self.previous_side = current_side
-        else:
-            raise ValueError("crossing_method must be 'center' or 'leading_edge'")
+    def _confirm_count(self, frame_idx):
+        self.count += 1
+        self.confirmed_crossings += 1
+        self.last_count_frame = int(frame_idx)
+        self.last_event_detected = True
+        self.armed_for_crossing = False
+        self.candidate_pending = False
+        self.candidate_frame_idx = None
+        self.state = COOLDOWN
 
-        self.last_event_detected = event_detected
-        self.current_side = current_side
-        self.current_blob_center = blob_center
-        self.current_blob_area = blob_area
-        self.current_left_edge = left_edge
-        self.current_right_edge = right_edge
-
-        if event_detected:
-            score_status = "scored"
-        elif self.crossing_method == "leading_edge" and not self.armed_for_crossing:
-            score_status = "waiting to re-arm on start side"
-        elif current_side == "neutral":
-            score_status = "inside dead zone"
-        elif cooldown_remaining > 0:
-            score_status = "motion seen, cooldown active"
-        elif self.crossing_method == "leading_edge" and self.has_leading_edge_crossed(blob_info):
-            score_status = "leading edge crossed, waiting for cooldown"
-        elif self.crossing_method == "leading_edge" and self.armed_for_crossing:
-            score_status = "armed, waiting for leading edge crossing"
-        elif self.previous_side == current_side:
-            score_status = "motion seen, same side"
-        else:
-            score_status = "motion seen, waiting for crossing"
-
+    def _make_result(
+        self,
+        frame_idx,
+        event_detected,
+        score_status,
+        blob_info,
+        current_side,
+        target_motion_area,
+        target_confirmed,
+    ):
+        cooldown_remaining = self._cooldown_remaining(frame_idx)
+        candidate_age_frames = self._candidate_age_frames(frame_idx)
         return {
             "count": self.count,
             "event_detected": event_detected,
             "motion_scored": event_detected,
-            "score_status": score_status,
-            "crossing_method": self.crossing_method,
-            "leading_edge_margin": self.leading_edge_margin,
+            "candidate_pending": self.candidate_pending,
+            "candidate_frame_idx": self.candidate_frame_idx,
+            "candidate_age_frames": candidate_age_frames,
+            "state": self.state,
             "current_side": current_side,
-            "previous_side": self.previous_side,
-            "armed_for_crossing": self.armed_for_crossing,
-            "blob_center": blob_center,
-            "blob_area": blob_area,
-            "left_edge": left_edge,
-            "right_edge": right_edge,
-            "bbox": bbox,
-            "zone_bounds": zone_bounds,
+            "blob_center": self.current_blob_center,
+            "blob_area": self.current_blob_area,
+            "left_edge": self.current_left_edge,
+            "right_edge": self.current_right_edge,
+            "bbox": None if blob_info is None else blob_info["bbox"],
+            "zone_bounds": None if blob_info is None else blob_info["zone_bounds"],
+            "target_motion_area": target_motion_area,
+            "target_confirmed": target_confirmed,
             "cooldown_remaining": cooldown_remaining,
+            "confirmation_mode": self.confirmation_mode,
+            "crossing_method": self.confirmation_mode,
+            "leading_edge_margin": self.leading_edge_margin,
+            "armed_for_crossing": self.armed_for_crossing,
+            "score_status": score_status,
         }
+
+    def update(self, cleaned_mask, frame_idx):
+        blob_info = self.find_main_blob(cleaned_mask)
+        current_side = "none"
+        target_confirmed, target_motion_area = self.has_target_confirmation(cleaned_mask)
+        event_detected = False
+        score_status = "no blob"
+
+        self.last_event_detected = False
+
+        if blob_info is None:
+            self.current_blob_center = None
+            self.current_blob_area = 0.0
+            self.current_left_edge = None
+            self.current_right_edge = None
+        else:
+            self.current_blob_center = blob_info["center"]
+            self.current_blob_area = blob_info["area"]
+            self.current_left_edge = blob_info["left_edge"]
+            self.current_right_edge = blob_info["right_edge"]
+            current_side = self.classify_side(blob_info["center"][0])
+
+        previous_side_before_update = self.previous_side
+        if blob_info is not None and current_side not in ("none", "neutral"):
+            self.previous_side = current_side
+
+        if self.confirmation_mode == "center":
+            cooldown_remaining = self._cooldown_remaining(frame_idx)
+            if cooldown_remaining > 0:
+                self.state = COOLDOWN
+                score_status = "cooldown active"
+            else:
+                self._arm_if_start_side_seen(blob_info, current_side)
+                self.state = ARMED if self.armed_for_crossing else WAITING_FOR_START
+                if (
+                    blob_info is not None
+                    and current_side not in ("none", "neutral")
+                    and self.is_valid_transition(previous_side_before_update, current_side)
+                    and self.armed_for_crossing
+                ):
+                    self._confirm_count(frame_idx)
+                    event_detected = True
+                    score_status = "center crossing confirmed"
+                elif blob_info is not None:
+                    score_status = "waiting for center crossing"
+
+        elif self.confirmation_mode == "leading_edge":
+            cooldown_remaining = self._cooldown_remaining(frame_idx)
+            if cooldown_remaining > 0:
+                self.state = COOLDOWN
+                score_status = "cooldown active"
+            else:
+                self._arm_if_start_side_seen(blob_info, current_side)
+                self.state = ARMED if self.armed_for_crossing else WAITING_FOR_START
+                if blob_info is not None and self.armed_for_crossing and self.has_leading_edge_crossed(blob_info):
+                    self._confirm_count(frame_idx)
+                    event_detected = True
+                    score_status = "leading edge crossing confirmed"
+                elif blob_info is not None and self.armed_for_crossing:
+                    score_status = "armed, waiting for leading edge crossing"
+                elif blob_info is not None:
+                    score_status = "waiting for start side"
+
+        elif self.confirmation_mode == "hybrid":
+            cooldown_remaining = self._cooldown_remaining(frame_idx)
+
+            if self.state == COOLDOWN:
+                if cooldown_remaining > 0:
+                    score_status = "cooldown active"
+                else:
+                    self.state = WAITING_FOR_START
+                    score_status = "cooldown finished"
+
+            if self.state == WAITING_FOR_START:
+                if self._blob_is_on_start_side(blob_info, current_side):
+                    self.armed_for_crossing = True
+                    self.state = ARMED
+                    score_status = "start side seen, detector armed"
+                else:
+                    self.armed_for_crossing = False
+                    score_status = "waiting for start side"
+
+            elif self.state == ARMED:
+                self.armed_for_crossing = True
+                if blob_info is not None and self.has_leading_edge_crossed(blob_info):
+                    self.candidate_pending = True
+                    self.candidate_frame_idx = int(frame_idx)
+                    self.total_candidate_crossings += 1
+                    self.state = CANDIDATE_PENDING
+                    score_status = "candidate crossing detected"
+                else:
+                    score_status = "armed, waiting for leading edge crossing"
+
+            elif self.state == CANDIDATE_PENDING:
+                self.candidate_pending = True
+                candidate_age_frames = self._candidate_age_frames(frame_idx) or 0
+                if target_confirmed:
+                    self._confirm_count(frame_idx)
+                    event_detected = True
+                    score_status = "hybrid crossing confirmed"
+                elif candidate_age_frames > self.target_confirmation_window_frames:
+                    self.candidate_pending = False
+                    self.candidate_frame_idx = None
+                    self.armed_for_crossing = False
+                    self.rejected_candidates += 1
+                    self.state = WAITING_FOR_START
+                    score_status = "candidate rejected, no target confirmation"
+                else:
+                    score_status = "candidate pending target confirmation"
+
+        else:
+            raise ValueError("confirmation_mode must be 'center', 'leading_edge', or 'hybrid'")
+
+        if blob_info is None and self.confirmation_mode != "hybrid":
+            score_status = "no blob"
+        elif blob_info is None and self.state == WAITING_FOR_START:
+            score_status = "no blob"
+
+        return self._make_result(
+            frame_idx=frame_idx,
+            event_detected=event_detected,
+            score_status=score_status,
+            blob_info=blob_info,
+            current_side=current_side,
+            target_motion_area=target_motion_area,
+            target_confirmed=target_confirmed,
+        )
 
     def draw_debug_overlay(self, frame, result):
         annotated = frame.copy()
         frame_height, frame_width = annotated.shape[:2]
 
-        x1 = self.partition_x - (self.crossing_zone_width // 2)
-        x2 = self.partition_x + (self.crossing_zone_width // 2)
-        x1 = max(0, x1)
-        x2 = min(frame_width, x2)
-
+        x1 = max(0, self.partition_x - (self.crossing_zone_width // 2))
+        x2 = min(frame_width, self.partition_x + (self.crossing_zone_width // 2))
         left_dead_zone = int(round(self.partition_x - (self.dead_zone_width / 2.0)))
         right_dead_zone = int(round(self.partition_x + (self.dead_zone_width / 2.0)))
         left_margin_line = int(round(self.partition_x - self.leading_edge_margin))
         right_margin_line = int(round(self.partition_x + self.leading_edge_margin))
 
+        # The partition line is the main reference for all crossing decisions.
         cv2.line(annotated, (self.partition_x, 0), (self.partition_x, frame_height - 1), (0, 0, 255), 2)
         cv2.rectangle(annotated, (x1, 0), (x2, frame_height - 1), (255, 0, 0), 2)
-        cv2.line(
-            annotated,
-            (max(left_dead_zone, 0), 0),
-            (max(left_dead_zone, 0), frame_height - 1),
-            (0, 255, 255),
-            2,
-        )
+        cv2.line(annotated, (max(left_dead_zone, 0), 0), (max(left_dead_zone, 0), frame_height - 1), (0, 255, 255), 2)
         cv2.line(
             annotated,
             (min(right_dead_zone, frame_width - 1), 0),
@@ -336,13 +427,7 @@ class CrossingCounter:
             (0, 255, 255),
             2,
         )
-        cv2.line(
-            annotated,
-            (max(left_margin_line, 0), 0),
-            (max(left_margin_line, 0), frame_height - 1),
-            (255, 180, 0),
-            2,
-        )
+        cv2.line(annotated, (max(left_margin_line, 0), 0), (max(left_margin_line, 0), frame_height - 1), (255, 180, 0), 2)
         cv2.line(
             annotated,
             (min(right_margin_line, frame_width - 1), 0),
@@ -351,6 +436,9 @@ class CrossingCounter:
             2,
         )
 
+        target_side_label = f"Target side: {self._get_target_side()}"
+        cv2.putText(annotated, target_side_label, (max(x2 + 10, 20), 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 220, 120), 2, cv2.LINE_AA)
+
         if result["bbox"] is not None:
             x, y, w, h = result["bbox"]
             cv2.rectangle(annotated, (x, y), (x + w, y + h), (50, 220, 50), 2)
@@ -358,78 +446,52 @@ class CrossingCounter:
         if result["blob_center"] is not None:
             cx, cy = result["blob_center"]
             cv2.circle(annotated, (cx, cy), 5, (50, 220, 50), -1)
+
         if result["left_edge"] is not None:
-            cv2.line(
-                annotated,
-                (int(result["left_edge"]), 0),
-                (int(result["left_edge"]), frame_height - 1),
-                (120, 255, 120),
-                1,
-            )
+            cv2.line(annotated, (int(result["left_edge"]), 0), (int(result["left_edge"]), frame_height - 1), (120, 255, 120), 1)
         if result["right_edge"] is not None:
-            cv2.line(
-                annotated,
-                (int(result["right_edge"]), 0),
-                (int(result["right_edge"]), frame_height - 1),
-                (120, 255, 120),
-                1,
-            )
+            cv2.line(annotated, (int(result["right_edge"]), 0), (int(result["right_edge"]), frame_height - 1), (120, 255, 120), 1)
 
-        score_status = result.get("score_status", "unknown")
-        scored_this_frame = bool(result.get("motion_scored", False))
-        status_color = (0, 220, 0) if scored_this_frame else (0, 200, 255)
-
+        candidate_age = result["candidate_age_frames"]
         info_lines = [
             f"Count: {result['count']}",
-            f"Scored this frame: {'YES' if scored_this_frame else 'NO'}",
-            f"Status: {score_status}",
-            f"Crossing method: {result['crossing_method']}",
-            f"Armed: {'YES' if result['armed_for_crossing'] else 'NO'}",
+            f"Mode: {result['confirmation_mode']}",
+            f"State: {result['state']}",
             f"Current side: {result['current_side']}",
-            f"Left edge: {result['left_edge']}",
-            f"Right edge: {result['right_edge']}",
-            f"Blob area: {result['blob_area']:.0f}",
+            f"Candidate pending: {'YES' if result['candidate_pending'] else 'NO'}",
+            f"Candidate age: {candidate_age if candidate_age is not None else '-'}",
+            f"Target motion area: {result['target_motion_area']}",
+            f"Target confirmed: {'YES' if result['target_confirmed'] else 'NO'}",
             f"Cooldown: {result['cooldown_remaining']}",
         ]
-        y = 30
+        y = 32
         for line in info_lines:
-            cv2.putText(annotated, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4, cv2.LINE_AA)
-            cv2.putText(annotated, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
-            y += 30
+            cv2.putText(annotated, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(annotated, line, (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA)
+            y += 28
 
+        if result["candidate_pending"]:
+            cv2.putText(
+                annotated,
+                "CANDIDATE",
+                (20, y + 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (0, 220, 255),
+                3,
+                cv2.LINE_AA,
+            )
         if result["event_detected"]:
             cv2.putText(
                 annotated,
-                "CROSSING!",
-                (20, y + 10),
+                "CROSSING CONFIRMED!",
+                (20, y + 45),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1.0,
                 (0, 255, 0),
                 3,
                 cv2.LINE_AA,
             )
-
-        badge_text = f"SCORE: {'YES' if scored_this_frame else 'NO'}"
-        text_size, _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.95, 2)
-        badge_x = max(frame_width - text_size[0] - 40, 20)
-        badge_y = 45
-        cv2.rectangle(
-            annotated,
-            (badge_x - 12, badge_y - 28),
-            (badge_x + text_size[0] + 12, badge_y + 12),
-            status_color,
-            -1,
-        )
-        cv2.putText(
-            annotated,
-            badge_text,
-            (badge_x, badge_y),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.95,
-            (0, 0, 0),
-            2,
-            cv2.LINE_AA,
-        )
 
         return annotated
 
@@ -461,16 +523,23 @@ def parse_args():
     parser.add_argument("--min-area", type=int, default=500, help="Minimum blob area to keep.")
     parser.add_argument("--cooldown-frames", type=int, default=20, help="Frames to wait before counting again.")
     parser.add_argument(
-        "--crossing-method",
-        choices=["center", "leading_edge"],
-        default="leading_edge",
-        help="How to decide that a crossing happened.",
+        "--confirmation-mode",
+        choices=["center", "leading_edge", "hybrid"],
+        default="hybrid",
+        help="How strict the detector should be before counting.",
     )
+    parser.add_argument("--leading-edge-margin", type=int, default=10, help="Margin past the partition for edge crossing.")
     parser.add_argument(
-        "--leading-edge-margin",
+        "--target-confirmation-window-frames",
         type=int,
         default=10,
-        help="How far the leading edge must pass the partition before it counts.",
+        help="How many frames hybrid mode waits for target-side confirmation.",
+    )
+    parser.add_argument(
+        "--target-motion-area-threshold",
+        type=int,
+        default=300,
+        help="Minimum target-side motion needed to confirm a hybrid candidate.",
     )
     parser.add_argument("--resize-width", type=int, default=None, help="Optional output frame width.")
     parser.add_argument("--resize-height", type=int, default=None, help="Optional output frame height.")
@@ -497,7 +566,9 @@ def main() -> int:
         min_area=args.min_area,
         cooldown_frames=args.cooldown_frames,
         leading_edge_margin=args.leading_edge_margin,
-        crossing_method=args.crossing_method,
+        confirmation_mode=args.confirmation_mode,
+        target_confirmation_window_frames=args.target_confirmation_window_frames,
+        target_motion_area_threshold=args.target_motion_area_threshold,
     )
     background_subtractor = cv2.createBackgroundSubtractorMOG2(
         history=500,
@@ -516,11 +587,7 @@ def main() -> int:
                 break
 
             frame_index += 1
-            resized_frame = resize_frame(
-                frame,
-                resize_width=args.resize_width,
-                resize_height=args.resize_height,
-            )
+            resized_frame = resize_frame(frame, resize_width=args.resize_width, resize_height=args.resize_height)
             raw_mask = background_subtractor.apply(resized_frame)
             cleaned_mask = clean_motion_mask(raw_mask)
             result = counter.update(cleaned_mask, frame_idx=frame_index)
@@ -556,11 +623,12 @@ def main() -> int:
         cv2.destroyAllWindows()
 
     print(f"Final automated count: {counter.count}")
-    print(f"Crossing method: {counter.crossing_method}")
+    print(f"Confirmation mode: {counter.confirmation_mode}")
     print(f"Leading edge margin: {counter.leading_edge_margin}")
-    print(f"Armed for crossing: {counter.armed_for_crossing}")
-    print(f"Last left edge: {counter.current_left_edge}")
-    print(f"Last right edge: {counter.current_right_edge}")
+    print(f"Total candidate crossings: {counter.total_candidate_crossings}")
+    print(f"Confirmed crossings: {counter.confirmed_crossings}")
+    print(f"Rejected candidates: {counter.rejected_candidates}")
+    print(f"Final count: {counter.count}")
     return 0
 
 

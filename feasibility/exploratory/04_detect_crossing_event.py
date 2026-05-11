@@ -31,8 +31,10 @@ CROSSING_ZONE_WIDTH = 100
 DEAD_ZONE_WIDTH = 20
 MIN_AREA = 500
 COOLDOWN_FRAMES = 20
-CROSSING_METHOD = "leading_edge"
+CONFIRMATION_MODE = "hybrid"
 LEADING_EDGE_MARGIN = 10
+TARGET_CONFIRMATION_WINDOW_FRAMES = 10
+TARGET_MOTION_AREA_THRESHOLD = 300
 
 
 def parse_args() -> argparse.Namespace:
@@ -108,7 +110,9 @@ def main() -> int:
         min_area=MIN_AREA,
         cooldown_frames=COOLDOWN_FRAMES,
         leading_edge_margin=LEADING_EDGE_MARGIN,
-        crossing_method=CROSSING_METHOD,
+        confirmation_mode=CONFIRMATION_MODE,
+        target_confirmation_window_frames=TARGET_CONFIRMATION_WINDOW_FRAMES,
+        target_motion_area_threshold=TARGET_MOTION_AREA_THRESHOLD,
     )
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -136,15 +140,23 @@ def main() -> int:
             score_label = f"Scored: {'YES' if result['motion_scored'] else 'NO'}"
             count_label = f"Count: {result['count']}"
             status_label = f"Status: {result['score_status']}"
-            method_label = f"Method: {result['crossing_method']} | Armed: {'YES' if result['armed_for_crossing'] else 'NO'}"
+            method_label = f"Mode: {result['confirmation_mode']} | State: {result['state']}"
             edge_label = (
                 f"Edges: left={result['left_edge']}, right={result['right_edge']} | "
                 f"margin={result['leading_edge_margin']}"
             )
+            candidate_label = (
+                f"Candidate: {'YES' if result['candidate_pending'] else 'NO'} | "
+                f"Age: {result['candidate_age_frames']} | Target confirmed: {'YES' if result['target_confirmed'] else 'NO'}"
+            )
+            target_area_label = (
+                f"Target motion area: {result['target_motion_area']} | "
+                f"Cooldown: {result['cooldown_remaining']} | Armed: {'YES' if result['armed_for_crossing'] else 'NO'}"
+            )
             cv2.putText(
                 annotated_frame,
                 f"{score_label} | {count_label}",
-                (20, resized_frame.shape[0] - 80),
+                (20, resized_frame.shape[0] - 110),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
                 (255, 255, 255),
@@ -154,6 +166,16 @@ def main() -> int:
             cv2.putText(
                 annotated_frame,
                 f"{status_label} | {method_label}",
+                (20, resized_frame.shape[0] - 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                annotated_frame,
+                candidate_label,
                 (20, resized_frame.shape[0] - 50),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -163,7 +185,7 @@ def main() -> int:
             )
             cv2.putText(
                 annotated_frame,
-                edge_label,
+                f"{edge_label} | {target_area_label}",
                 (20, resized_frame.shape[0] - 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.7,
@@ -202,8 +224,11 @@ def main() -> int:
     print(f"Processed video: {video_path}")
     print(f"Frames processed: {frame_index}")
     print(f"Automated crossing count: {counter.count}")
-    print(f"Crossing method: {counter.crossing_method}")
+    print(f"Confirmation mode: {counter.confirmation_mode}")
     print(f"Leading edge margin: {counter.leading_edge_margin}")
+    print(f"Total candidate crossings: {counter.total_candidate_crossings}")
+    print(f"Confirmed crossings: {counter.confirmed_crossings}")
+    print(f"Rejected candidates: {counter.rejected_candidates}")
     return 0
 
 

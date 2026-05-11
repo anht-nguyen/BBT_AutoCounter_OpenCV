@@ -219,3 +219,8 @@ __marimo__/
 
 # Data files
 **/data/**
+
+# Local MediaPipe task models
+feasibility/models/*.task
+feasibility/models/mediapipe/*.task
+models/*.task
