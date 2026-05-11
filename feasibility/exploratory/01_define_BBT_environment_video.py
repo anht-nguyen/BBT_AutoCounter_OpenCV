@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,12 +20,34 @@ MASK_DIR = ANNOTATION_DIR / "masks"
 ENVIRONMENT_JSON = ANNOTATION_DIR / "BBT_environment.json"
 VIDEO_PATH = FEASIBILITY_ROOT / "data" / "videos" / "raw" / "BBT-ground_truth.mp4"
 OUTPUT_DIR = FEASIBILITY_ROOT / "data" / "videos" / "annotated"
-OUTPUT_VIDEO = OUTPUT_DIR / "BBT-ground_truth_environment_overlay.mp4"
 
 WINDOW_NAME = "BBT Environment Applied To Video"
 DISPLAY_SCALE = 0.7
 PREVIEW_MAX_FRAMES = None
 WRITE_OUTPUT_VIDEO = True
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Preview the saved BBT environment overlays on a raw video."
+    )
+    parser.add_argument(
+        "--video",
+        type=Path,
+        default=VIDEO_PATH,
+        help="Path to the raw input video.",
+    )
+    parser.add_argument(
+        "--output-video",
+        type=Path,
+        default=None,
+        help="Optional path for the annotated output video.",
+    )
+    return parser.parse_args()
+
+
+def build_output_video_path(video_path: Path) -> Path:
+    return OUTPUT_DIR / f"{video_path.stem}_environment_overlay.mp4"
 
 
 @dataclass
@@ -145,11 +168,13 @@ def open_writer(output_path: Path, frame_size: tuple[int, int], fps: float) -> c
 
 
 def main() -> int:
+    args = parse_args()
+    video_path = args.video.expanduser().resolve()
     environment = load_environment(ENVIRONMENT_JSON)
 
-    capture = cv2.VideoCapture(str(VIDEO_PATH))
+    capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
-        raise FileNotFoundError(f"Could not open video: {VIDEO_PATH}")
+        raise FileNotFoundError(f"Could not open video: {video_path}")
 
     frame_width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -162,7 +187,8 @@ def main() -> int:
         "crossing_zone": load_mask(MASK_DIR / "crossing_zone_mask.png", frame_size),
     }
 
-    writer = open_writer(OUTPUT_VIDEO, frame_size, fps) if WRITE_OUTPUT_VIDEO else None
+    output_video = args.output_video.expanduser().resolve() if args.output_video else build_output_video_path(video_path)
+    writer = open_writer(output_video, frame_size, fps) if WRITE_OUTPUT_VIDEO else None
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
@@ -205,9 +231,9 @@ def main() -> int:
         cv2.destroyAllWindows()
 
     print(f"Applied masks from: {MASK_DIR}")
-    print(f"Processed video: {VIDEO_PATH}")
+    print(f"Processed video: {video_path}")
     if writer is not None:
-        print(f"Saved annotated video to: {OUTPUT_VIDEO}")
+        print(f"Saved annotated video to: {output_video}")
     print(f"Frames processed: {frame_index}")
     return 0
 
