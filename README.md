@@ -32,9 +32,15 @@ To develop and evaluate a computer vision pipeline that estimates Box and Block 
 
 ## Technical Approach
 
-The initial approach uses crossing-line detection.
+The current prototype uses a staged, explainable pipeline built around:
 
-A virtual line is defined at or near the partition between the start and target compartments. The algorithm detects block-like motion near this line and counts one valid transfer event when a moving object crosses from the start side into the target side.
+- environment annotation
+- background-subtraction motion detection
+- crossing-event detection near the partition
+- optional MediaPipe hand and fingertip confirmation
+- optional target-side non-hand motion / persistence confirmation
+
+A virtual line is defined at or near the partition between the start and target compartments. The algorithm first detects transfer-like motion near this line, then can optionally require hand/fingertip confirmation and target-side non-hand object confirmation before scoring a transfer.
 
 This approach was selected because it is:
 
@@ -55,12 +61,14 @@ The expected workflow is:
    - Target compartment
    - Partition zone
    - Crossing line
-3. Detect motion or block-like objects near the partition.
-4. Track movement direction across the partition.
-5. Count a valid transfer event when a block-like object crosses from the start side to the target side.
-6. Apply rules to reduce double-counting.
-7. Export the automated count.
-8. Compare automated scoring against manual scoring.
+3. Detect motion near the partition with background subtraction.
+4. Clean the motion mask and track the main moving blob.
+5. Detect transfer-like crossings from center, leading-edge, or hybrid motion logic.
+6. Optionally confirm that fingertips cross the partition using MediaPipe hand landmarks.
+7. Optionally confirm target-side non-hand motion or short post-crossing persistence as a block-transfer proxy.
+8. Apply cooldown and gating rules to reduce double-counting and invalid scores.
+9. Export annotated videos and automated counts.
+10. Compare automated scoring against manual scoring.
 
 ## Example Counting Rule
 
@@ -109,6 +117,25 @@ This repository may include:
 - Example figures
 - Documentation for recording setup and algorithm use
 
+## Current Feasibility Pipeline
+
+The active exploratory flow under `feasibility/` is:
+
+1. `00_define_BBT_environment_image.py`
+   Annotate box corners and partition line on a reference image.
+2. `01_define_BBT_environment_video.py`
+   Preview the saved environment on raw videos.
+3. `02_detect_motion.py`
+   Detect motion in the crossing zone.
+4. `03_clean_motion_mask.py`
+   Inspect raw vs cleaned motion masks and contour filtering.
+5. `04_detect_crossing_event.py`
+   Inspect motion-only scoring with the rule-based crossing detector.
+6. `05_hand_motion_confirmation.py`
+   Inspect optional MediaPipe fingertip and non-hand motion confirmation.
+7. `06_scoring_w_hand_confirm.py`
+   Combine motion scoring, hand confirmation, and object-side confirmation in one annotated scoring view.
+
 ## Repository Structure
 
 A possible repository structure is:
@@ -146,7 +173,13 @@ After the offline pipeline is working, the same logic can be adapted to an onlin
 
 This prototype is expected to work best in controlled conditions. It may not generalize to all clinical environments, camera angles, lighting conditions, participant movement patterns, or box/block designs.
 
-The primary goal is feasibility, not perfect automatic scoring.
+Important current limitations:
+
+- motion-based crossing is still a proxy, not true block tracking
+- MediaPipe hand confirmation is optional and uses an approximate landmark-based hand region, not pixel-perfect hand segmentation
+- object confirmation currently uses non-hand target-side motion and short persistence, not direct block detection
+
+The primary goal remains feasibility, not perfect automatic scoring.
 
 ## Future Directions
 

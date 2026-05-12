@@ -8,6 +8,8 @@ The codebase is organized as a small exploratory pipeline:
 2. Apply that environment overlay to raw videos.
 3. Detect and clean motion blobs near the partition.
 4. Score crossing events with a rule-based counter.
+5. Optionally confirm hand/fingertip crossing with MediaPipe.
+6. Optionally confirm target-side non-hand object motion / persistence.
 
 This is still a feasibility prototype, not a clinical scoring system.
 
@@ -42,12 +44,18 @@ feasibility/
 |   +-- 02_detect_motion.py
 |   +-- 03_clean_motion_mask.py
 |   +-- 04_detect_crossing_event.py
+|   +-- 05_hand_motion_confirmation.py
+|   +-- 06_scoring_w_hand_confirm.py
 |   `-- all_exploratory_steps.py
 +-- src/
 |   +-- crossing_event_detector.py
 |   +-- define_BBT_environment.py
 |   +-- detect_hand_motion_blob.py
-|   `-- motion_mask_cleaning.py
+|   +-- hand_motion_confirmation.py
+|   +-- motion_mask_cleaning.py
+|   `-- object_transfer_confirmation.py
++-- models/
+|   `-- README.md
 `-- utility/
     `-- export_first_frame.py
 ```
@@ -61,18 +69,26 @@ feasibility/
 - Cleans masks with Gaussian blur, thresholding, opening, and closing.
 - Extracts the largest motion blob inside the crossing zone.
 - Scores transfer-like events with a configurable `CrossingCounter`.
-- Supports two crossing methods: `center` and `leading_edge`.
+- Supports three motion confirmation modes: `center`, `leading_edge`, and `hybrid`.
+- Optionally uses MediaPipe hand landmarks to confirm fingertip crossing and split hand vs non-hand motion.
+- Optionally uses target-side non-hand motion / persistence as a simple block-transfer proxy.
 - Can display live debug views and save annotated videos.
 
 ## Dependencies
 
-The prototype uses Python with OpenCV and NumPy.
+The prototype uses Python with OpenCV and NumPy. Optional hand confirmation also uses MediaPipe.
 
 ```bash
-pip install opencv-python numpy
+pip install opencv-python numpy mediapipe
 ```
 
 Note: the scripts use OpenCV GUI windows (`cv2.imshow`, mouse callbacks, keyboard controls), so they are meant to be run in a local desktop session rather than a headless environment.
+
+If your MediaPipe install exposes only the Tasks API, place a local hand-landmarker model at:
+
+```text
+feasibility/models/hand_landmarker.task
+```
 
 ## Main Workflow
 
@@ -197,10 +213,71 @@ Current scoring defaults in this script:
 - `DEAD_ZONE_WIDTH = 20`
 - `MIN_AREA = 500`
 - `COOLDOWN_FRAMES = 20`
-- `CROSSING_METHOD = "leading_edge"`
+- `CONFIRMATION_MODE = "hybrid"`
 - `LEADING_EDGE_MARGIN = 10`
+- `TARGET_CONFIRMATION_WINDOW_FRAMES = 10`
+- `TARGET_MOTION_AREA_THRESHOLD = 300`
 
-### 6. Run Steps 01 To 04 Across Selected Videos
+### 6. Inspect Hand Motion Confirmation
+
+`exploratory/05_hand_motion_confirmation.py` inspects optional MediaPipe-based hand confirmation on the same BBT video. It shows:
+
+- original frame
+- cleaned motion mask
+- hand-vs-non-hand motion debug view
+- hand confirmation overlay
+
+Command:
+
+```bash
+python feasibility/exploratory/05_hand_motion_confirmation.py --model-asset-path path/to/hand_landmarker.task
+```
+
+Current defaults in this script:
+
+- `FINGERTIP_MARGIN = 10`
+- `HAND_MASK_PADDING = 20`
+- `HAND_MASK_DILATION = 15`
+- `TARGET_NON_HAND_MOTION_THRESHOLD = 300`
+- selected fingertips: `thumb`, `index`, `middle`
+
+### 7. Inspect Combined Scoring With Hand Confirmation
+
+`exploratory/06_scoring_w_hand_confirm.py` combines:
+
+- motion-event detection from `CrossingCounter`
+- fingertip confirmation from `HandMotionConfirmator`
+- target-side non-hand object confirmation from `ObjectTransferConfirmator`
+
+It displays:
+
+- original frame
+- cleaned motion mask
+- contour debug
+- scoring and count overlay
+
+By default it writes:
+
+```text
+feasibility/data/videos/annotated/<video_stem>_scoring_with_hand_confirmation.mp4
+```
+
+Command:
+
+```bash
+python feasibility/exploratory/06_scoring_w_hand_confirm.py --model-asset-path path/to/hand_landmarker.task
+```
+
+Main combined-gating defaults:
+
+- `FINGERTIP_CONFIRM_WINDOW_FRAMES = 10`
+- `OBJECT_CONFIRM_WINDOW_FRAMES = 5`
+- `TARGET_NON_HAND_MOTION_THRESHOLD = 300`
+- `PERSISTENCE_MOTION_THRESHOLD = 120`
+- `PERSISTENCE_FRAMES_REQUIRED = 2`
+- `ABSENCE_RESET_FRAMES = 4`
+
+### 8. Run Steps 01 To 04 Across Selected Videos
 
 `exploratory/all_exploratory_steps.py` prompts you to choose one or more raw videos from `data/videos/raw/`, then runs:
 
@@ -272,7 +349,9 @@ The main class is `CrossingCounter`, which tracks:
 - dead-zone behavior
 - cooldown frames
 - arming/re-arming logic
-- either center-based or leading-edge crossing detection
+- center, leading-edge, or hybrid motion confirmation
+- candidate crossing state
+- target-side motion confirmation
 
 It also exposes a CLI:
 
@@ -285,8 +364,10 @@ python feasibility/src/crossing_event_detector.py \
   --dead-zone-width 20 \
   --min-area 500 \
   --cooldown-frames 20 \
-  --crossing-method leading_edge \
+  --confirmation-mode hybrid \
   --leading-edge-margin 10 \
+  --target-confirmation-window-frames 10 \
+  --target-motion-area-threshold 300 \
   --display \
   --save-output feasibility/data/videos/annotated/BBT-ground_truth_crossing_debug.mp4
 ```
@@ -300,12 +381,53 @@ Supported CLI arguments:
 - `--dead-zone-width`
 - `--min-area`
 - `--cooldown-frames`
-- `--crossing-method`
+- `--confirmation-mode`
 - `--leading-edge-margin`
+- `--target-confirmation-window-frames`
+- `--target-motion-area-threshold`
 - `--resize-width`
 - `--resize-height`
 - `--display`
 - `--save-output`
+
+### `hand_motion_confirmation.py`
+
+Optional MediaPipe-based hand confirmation utilities:
+
+- `HandMotionConfirmator`
+- `detect_landmarks(...)`
+- `create_hand_region_mask(...)`
+- `split_motion_mask(...)`
+- `check_fingertip_crossing(...)`
+- `detect_block_without_fingertip_crossing(...)`
+
+This module uses hand landmarks to build an approximate hand region. It is not a true segmentation model.
+
+CLI example:
+
+```bash
+python feasibility/src/hand_motion_confirmation.py \
+  --video feasibility/data/videos/raw/BBT-ground_truth.mp4 \
+  --partition-x 640 \
+  --direction left_to_right \
+  --model-asset-path path/to/hand_landmarker.task \
+  --display
+```
+
+### `object_transfer_confirmation.py`
+
+Approximate target-side object confirmation utilities:
+
+- `ObjectTransferConfirmator`
+- `analyze_frame(...)`
+- `draw_debug_overlay(...)`
+
+This module does not detect a block directly. Instead, it uses:
+
+- target-side non-hand motion
+- short-lived post-crossing persistence
+
+as a simple transfer proxy.
 
 ## Utility Script
 
@@ -353,6 +475,7 @@ Current saved image/environment assets:
 - Press space in the video preview scripts to pause on the current frame.
 - The exploratory scripts use hard-coded defaults intended for inspection and iteration, not for batch evaluation.
 - `04_detect_crossing_event.py` currently uses a fixed `PARTITION_X = 640`; it does not yet derive that value automatically from `BBT_environment.json`.
+- `05_hand_motion_confirmation.py` and `06_scoring_w_hand_confirm.py` require a MediaPipe hand-landmarker model on Tasks-only MediaPipe installs.
 
 ## Current Status
 
@@ -362,6 +485,9 @@ The current repo state is strongest as an interactive exploratory toolkit for:
 - validating the crossing zone
 - inspecting motion masks
 - tuning blob filtering
-- comparing center-based vs leading-edge crossing logic
+- comparing center vs leading-edge vs hybrid motion logic
+- testing fingertip confirmation
+- testing non-hand target-side object confirmation
+- testing combined motion + hand + object gating
 
 It is not yet a full evaluation pipeline with ground-truth tables, summary metrics, or automated experiment reporting.
