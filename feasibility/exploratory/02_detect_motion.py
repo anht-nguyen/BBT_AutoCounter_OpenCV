@@ -9,14 +9,15 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FEASIBILITY_ROOT = PROJECT_ROOT / "feasibility"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from feasibility.src.detect_hand_motion_blob import HandMotionBlobDetector
-from feasibility.src.detect_hand_motion_blob import MotionDetectorConfig
-from feasibility.src.detect_hand_motion_blob import annotate_motion_frame
-from feasibility.src.detect_hand_motion_blob import build_debug_panel
-from feasibility.src.detect_hand_motion_blob import load_environment
+from bbt_autocounter.environment import load_environment
+from bbt_autocounter.motion import CrossingZoneMotionDetector
+from bbt_autocounter.motion import MotionDetectorConfig
+from bbt_autocounter.motion import annotate_motion_frame
+from bbt_autocounter.motion import build_motion_debug_panel
 
 
 ENVIRONMENT_JSON = FEASIBILITY_ROOT / "data" / "images" / "annotations" / "BBT_environment.json"
@@ -34,9 +35,6 @@ CONFIG = MotionDetectorConfig(
     history=500,
     var_threshold=50,
     detect_shadows=False,
-    blur_kernel_size=(5, 5),
-    threshold_value=200,
-    morphology_kernel_size=(5, 5),
     min_area=500,
 )
 
@@ -68,7 +66,7 @@ def open_writer(output_path: Path, frame_size: tuple[int, int], fps: float) -> c
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        cv2.VideoWriter.fourcc(*"mp4v"),
         fps if fps > 0 else 30.0,
         frame_size,
     )
@@ -87,7 +85,7 @@ def main() -> int:
     args = parse_args()
     video_path = args.video.expanduser().resolve()
     environment = load_environment(ENVIRONMENT_JSON)
-    detector = HandMotionBlobDetector(environment=environment, config=CONFIG)
+    detector = CrossingZoneMotionDetector(environment=environment, config=CONFIG)
 
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -119,7 +117,7 @@ def main() -> int:
                 result=result,
                 show_all_contours=SHOW_ALL_CONTOURS,
             )
-            debug_panel = build_debug_panel(frame, result)
+            debug_panel = build_motion_debug_panel(frame, result)
 
             if writer is not None:
                 writer.write(annotated)

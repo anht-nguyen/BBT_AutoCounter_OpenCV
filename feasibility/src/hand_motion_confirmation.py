@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Literal
 
 import cv2
 import numpy as np
@@ -62,19 +64,30 @@ DEFAULT_MODEL_CANDIDATE_PATHS = (
 )
 
 
+@dataclass
+class LandmarkDetectionResult:
+    hand_detected: bool
+    landmarks: list[tuple[int, int]] | None
+    handedness: str | None
+
+
 def resize_frame(frame, resize_width=None, resize_height=None):
     if resize_width is None and resize_height is None:
         return frame
 
     height, width = frame.shape[:2]
-    if resize_width is None:
-        scale = float(resize_height) / float(height)
-        resize_width = int(round(width * scale))
-    elif resize_height is None:
-        scale = float(resize_width) / float(width)
-        resize_height = int(round(height * scale))
+    target_width = resize_width
+    target_height = resize_height
+    if target_width is None:
+        if target_height is None:
+            raise ValueError("resize_height must be provided when resize_width is omitted")
+        scale = float(target_height) / float(height)
+        target_width = int(round(width * scale))
+    elif target_height is None:
+        scale = float(target_width) / float(width)
+        target_height = int(round(height * scale))
 
-    return cv2.resize(frame, (int(resize_width), int(resize_height)), interpolation=cv2.INTER_AREA)
+    return cv2.resize(frame, (int(target_width), int(target_height)), interpolation=cv2.INTER_AREA)
 
 
 def mask_to_bgr(mask):
@@ -134,7 +147,7 @@ class HandMotionConfirmator:
                 )
 
     @staticmethod
-    def _load_mediapipe():
+    def _load_mediapipe() -> Any:
         try:
             import mediapipe as mp
         except ImportError as exc:
@@ -152,10 +165,12 @@ class HandMotionConfirmator:
                 return candidate_path.resolve()
         return None
 
-    def _create_mediapipe_hands(self):
+    def _create_mediapipe_hands(self) -> tuple[Any, Any, Literal["solutions", "tasks"]]:
         mp = self._load_mediapipe()
-        if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
-            hands = mp.solutions.hands.Hands(
+        solutions = getattr(mp, "solutions", None)
+        hands_module = getattr(solutions, "hands", None)
+        if hands_module is not None:
+            hands = hands_module.Hands(
                 static_image_mode=False,
                 max_num_hands=self.max_num_hands,
                 min_detection_confidence=self.min_detection_confidence,
@@ -196,7 +211,7 @@ class HandMotionConfirmator:
 
         raise RuntimeError("Unsupported MediaPipe installation: no supported hand detection API found.")
 
-    def detect_landmarks(self, frame):
+    def detect_landmarks(self, frame) -> LandmarkDetectionResult:
         """Detect one hand and return landmark pixel coordinates."""
         frame_height, frame_width = frame.shape[:2]
 
@@ -205,14 +220,10 @@ class HandMotionConfirmator:
             results = self._hands.process(frame_rgb)
 
             if not results.multi_hand_landmarks:
-                return {
-                    "hand_detected": False,
-                    "landmarks": None,
-                    "handedness": None,
-                }
+                return LandmarkDetectionResult(hand_detected=False, landmarks=None, handedness=None)
 
             hand_landmarks = results.multi_hand_landmarks[0]
-            pixel_landmarks = []
+            pixel_landmarks: list[tuple[int, int]] = []
             for landmark in hand_landmarks.landmark:
                 x = int(round(landmark.x * frame_width))
                 y = int(round(landmark.y * frame_height))
@@ -224,24 +235,16 @@ class HandMotionConfirmator:
             if results.multi_handedness:
                 handedness = results.multi_handedness[0].classification[0].label
 
-            return {
-                "hand_detected": True,
-                "landmarks": pixel_landmarks,
-                "handedness": handedness,
-            }
+            return LandmarkDetectionResult(hand_detected=True, landmarks=pixel_landmarks, handedness=handedness)
 
         if self._backend == "tasks":
             mp_image = self._mp.Image(image_format=self._mp.ImageFormat.SRGB, data=cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
             results = self._hands.detect(mp_image)
             if not results.hand_landmarks:
-                return {
-                    "hand_detected": False,
-                    "landmarks": None,
-                    "handedness": None,
-                }
+                return LandmarkDetectionResult(hand_detected=False, landmarks=None, handedness=None)
 
             hand_landmarks = results.hand_landmarks[0]
-            pixel_landmarks = []
+            pixel_landmarks: list[tuple[int, int]] = []
             for landmark in hand_landmarks:
                 x = int(round(landmark.x * frame_width))
                 y = int(round(landmark.y * frame_height))
@@ -253,11 +256,7 @@ class HandMotionConfirmator:
             if getattr(results, "handedness", None):
                 handedness = results.handedness[0][0].category_name
 
-            return {
-                "hand_detected": True,
-                "landmarks": pixel_landmarks,
-                "handedness": handedness,
-            }
+            return LandmarkDetectionResult(hand_detected=True, landmarks=pixel_landmarks, handedness=handedness)
 
         raise RuntimeError(f"Unsupported MediaPipe backend: {self._backend}")
 
@@ -346,19 +345,19 @@ class HandMotionConfirmator:
         crossed_fingertips = []
         fingertip_positions = {}
 
-        if landmark_result["hand_detected"]:
-            hand_region_mask = self.create_hand_region_mask(frame.shape, landmark_result["landmarks"])
+        if landmark_result.hand_detected:
+            hand_region_mask = self.create_hand_region_mask(frame.shape, landmark_result.landmarks)
             hand_motion_mask, non_hand_motion_mask = self.split_motion_mask(motion_mask, hand_region_mask)
             fingertip_crossed, crossed_fingertips, fingertip_positions = self.check_fingertip_crossing(
-                landmark_result["landmarks"]
+                landmark_result.landmarks
             )
 
         target_non_hand_motion_area = self.compute_target_side_non_hand_motion_area(non_hand_motion_mask)
 
         return {
-            "hand_detected": landmark_result["hand_detected"],
-            "landmarks": landmark_result["landmarks"],
-            "handedness": landmark_result["handedness"],
+            "hand_detected": landmark_result.hand_detected,
+            "landmarks": landmark_result.landmarks,
+            "handedness": landmark_result.handedness,
             "fingertip_crossed": fingertip_crossed,
             "crossed_fingertips": crossed_fingertips,
             "fingertip_positions": fingertip_positions,
@@ -568,7 +567,7 @@ def main() -> int:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 writer = cv2.VideoWriter(
                     str(output_path),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    cv2.VideoWriter.fourcc(*"mp4v"),
                     fps if fps > 0 else 30.0,
                     (overlay.shape[1], overlay.shape[0]),
                 )

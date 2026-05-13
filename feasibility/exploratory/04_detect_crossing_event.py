@@ -9,14 +9,15 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FEASIBILITY_ROOT = PROJECT_ROOT / "feasibility"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from feasibility.src.crossing_event_detector import CrossingCounter
-from feasibility.src.motion_mask_cleaning import clean_motion_mask
-from feasibility.src.motion_mask_cleaning import draw_contour_debug
-from feasibility.src.motion_mask_cleaning import filter_contours_by_area
-from feasibility.src.motion_mask_cleaning import resize_frame
+from bbt_autocounter.crossing import CrossingCounter
+from bbt_autocounter.motion import clean_motion_mask
+from bbt_autocounter.motion import draw_contour_debug
+from bbt_autocounter.motion import filter_contours_by_area
+from bbt_autocounter.ui import resize_frame
 
 
 VIDEO_PATH = FEASIBILITY_ROOT / "data" / "videos" / "raw" / "BBT-ground_truth.mp4"

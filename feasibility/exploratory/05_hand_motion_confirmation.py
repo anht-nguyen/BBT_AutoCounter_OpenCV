@@ -9,12 +9,13 @@ import numpy as np
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 FEASIBILITY_ROOT = PROJECT_ROOT / "feasibility"
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
-from feasibility.src.hand_motion_confirmation import HandMotionConfirmator
-from feasibility.src.hand_motion_confirmation import clean_motion_mask
-from feasibility.src.hand_motion_confirmation import resize_frame
+from bbt_autocounter.hand_confirmation import HandMotionConfirmator
+from bbt_autocounter.motion import clean_motion_mask
+from bbt_autocounter.ui import resize_frame
 
 
 VIDEO_PATH = FEASIBILITY_ROOT / "data" / "videos" / "raw" / "BBT-ground_truth.mp4"

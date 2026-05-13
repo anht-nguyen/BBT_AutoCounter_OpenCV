@@ -7,7 +7,7 @@ import cv2
 import numpy as np
 
 try:
-    from mask_cleaning import clean_motion_mask
+    from motion_mask_cleaning import clean_motion_mask
 except ImportError:
     try:
         from feasibility.src.motion_mask_cleaning import clean_motion_mask
@@ -501,14 +501,18 @@ def resize_frame(frame, resize_width=None, resize_height=None):
         return frame
 
     height, width = frame.shape[:2]
-    if resize_width is None:
-        scale = float(resize_height) / float(height)
-        resize_width = int(round(width * scale))
-    elif resize_height is None:
-        scale = float(resize_width) / float(width)
-        resize_height = int(round(height * scale))
+    target_width = resize_width
+    target_height = resize_height
+    if target_width is None:
+        if target_height is None:
+            raise ValueError("resize_height must be provided when resize_width is omitted")
+        scale = float(target_height) / float(height)
+        target_width = int(round(width * scale))
+    elif target_height is None:
+        scale = float(target_width) / float(width)
+        target_height = int(round(height * scale))
 
-    return cv2.resize(frame, (int(resize_width), int(resize_height)), interpolation=cv2.INTER_AREA)
+    return cv2.resize(frame, (int(target_width), int(target_height)), interpolation=cv2.INTER_AREA)
 
 
 def parse_args():
@@ -598,7 +602,7 @@ def main() -> int:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 writer = cv2.VideoWriter(
                     str(output_path),
-                    cv2.VideoWriter_fourcc(*"mp4v"),
+                    cv2.VideoWriter.fourcc(*"mp4v"),
                     fps if fps > 0 else 30.0,
                     (annotated_frame.shape[1], annotated_frame.shape[0]),
                 )

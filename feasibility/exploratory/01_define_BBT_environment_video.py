@@ -158,7 +158,7 @@ def open_writer(output_path: Path, frame_size: tuple[int, int], fps: float) -> c
     output_path.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(
         str(output_path),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        cv2.VideoWriter.fourcc(*"mp4v"),
         fps if fps > 0 else 30.0,
         frame_size,
     )
